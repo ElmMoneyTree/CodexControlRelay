@@ -1,0 +1,18 @@
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CODEX_RELAY_CONTROL_TOKEN: ${CODEX_RELAY_CONTROL_TOKEN:?set a random token of at least 32 characters}
+    command: ["--config", "/etc/codex-relay/relay.yaml"]
+    volumes:
+      - ./relay.docker.yaml:/etc/codex-relay/relay.yaml:ro
+      - relay-data:/var/lib/codex-relay
+    # Keep the backend private; terminate HTTPS in a reverse proxy on the host.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  relay-data:

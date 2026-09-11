@@ -1,0 +1,19 @@
+server:
+  listen: 0.0.0.0:8787
+  public_url: https://relay.example.com:8787
+  trusted_proxies: []
+  tls:
+    cert_file: /etc/codex-relay/tls/fullchain.pem
+    key_file: /etc/codex-relay/tls/privkey.pem
+
+database:
+  path: /var/lib/codex-relay/relay.sqlite
+
+security:
+  control_token_env: CODEX_RELAY_CONTROL_TOKEN
+  allow_insecure_http: false
+  allowed_origins: []
+
+logging:
+  level: info
+  format: json

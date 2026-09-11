@@ -1,0 +1,32 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+relay.yaml
+relay.yml
+relay.env
+*.key
+
+# Runtime data and logs
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# Build and test output
+/codex-relay
+/codex-relay.exe
+/dist/
+/bin/
+/coverage/
+*.test
+coverage.out
+go.work
+go.work.sum
+
+# Local caches and operating-system files
+.tmp/
+.DS_Store
+Thumbs.db

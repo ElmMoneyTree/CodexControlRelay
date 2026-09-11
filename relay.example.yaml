@@ -1,0 +1,52 @@
+# Codex Control Go Relay configuration.
+# Copy this file to relay.yaml. Relative paths are resolved from this file.
+
+server:
+  # Safe default for Nginx/Caddy on the same host. For direct TLS, use
+  # 0.0.0.0:8787 and configure both TLS files below.
+  listen: 127.0.0.1:8787
+  public_url: https://relay.example.com
+  read_header_timeout: 5s
+  read_timeout: 15s
+  write_timeout: 30s
+  idle_timeout: 60s
+  shutdown_timeout: 15s
+  max_body_bytes: 1000000
+  # Only trust X-Forwarded-For from these directly connected proxies.
+  trusted_proxies:
+    - 127.0.0.1/32
+    - ::1/128
+  tls:
+    cert_file: ""
+    key_file: ""
+
+database:
+  path: data/relay.sqlite
+  busy_timeout: 5s
+
+security:
+  # Prefer the environment variable. Inline tokens are supported for private
+  # installations but should not be committed to source control.
+  control_token: ""
+  control_token_env: CODEX_RELAY_CONTROL_TOKEN
+  # Leave false when Relay terminates TLS itself or only listens on loopback.
+  allow_insecure_http: false
+  pairing_code_ttl: 10m
+  offline_after: 15s
+  # Keep empty for native Controller/mobile clients. Add exact HTTPS origins
+  # only when a browser frontend must call Relay directly.
+  allowed_origins: []
+  rate_limits:
+    enrollment:
+      requests: 10
+      window: 1m
+    control:
+      requests: 300
+      window: 1m
+    agent:
+      requests: 1200
+      window: 1m
+
+logging:
+  level: info
+  format: json
