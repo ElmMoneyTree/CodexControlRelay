@@ -56,7 +56,7 @@ func TestOpenMigratesLegacyTurnIDToNullable(t *testing.T) {
 	if err := database.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
+	if version != 6 {
 		t.Fatalf("unexpected schema version %d", version)
 	}
 }
@@ -85,6 +85,42 @@ func TestPairingCodeIsSingleUse(t *testing.T) {
 	deviceID, ok, err := database.AuthenticateAgent(ctx, enrollment.Token)
 	if err != nil || !ok || deviceID != enrollment.DeviceID {
 		t.Fatalf("agent authentication failed: %s %v %v", deviceID, ok, err)
+	}
+}
+
+func TestOpenAddsIdentityColumnsToLegacyDeviceTable(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "legacy-devices.sqlite")
+	legacy, err := sql.Open("sqlite", file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE devices (
+		id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL, account_label TEXT, status TEXT NOT NULL DEFAULT 'offline',
+		last_seen_at INTEGER, created_at INTEGER NOT NULL
+	);
+	INSERT INTO devices(id,owner_id,token_hash,name,status,created_at) VALUES('legacy-device','legacy-owner','` + hash("legacy-token") + `','Legacy PC','offline',1);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := Open(file, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	for _, column := range []string{"device_public_key", "device_key_fingerprint", "claimed_by_user_id", "revoked_at"} {
+		var count int
+		if err := database.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name=?", column).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("migrated column %s count=%d err=%v", column, count, err)
+		}
+	}
+	deviceID, ok, err := database.AuthenticateAgent(context.Background(), "legacy-token")
+	if err != nil || !ok || deviceID != "legacy-device" {
+		t.Fatalf("legacy credential was not preserved: id=%q ok=%v err=%v", deviceID, ok, err)
 	}
 }
 

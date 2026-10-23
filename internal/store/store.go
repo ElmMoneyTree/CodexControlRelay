@@ -23,6 +23,12 @@ var (
 	ErrPairingCodeInvalid  = errors.New("pairing code is invalid or expired")
 	ErrDeviceNotFound      = errors.New("device not found")
 	ErrCommandNotClaimable = errors.New("command is not claimable")
+	ErrAccountExists       = errors.New("account already exists")
+	ErrInvalidCredentials  = errors.New("invalid credentials")
+	ErrClaimInvalid        = errors.New("device claim is invalid or expired")
+	ErrClaimAlreadyUsed    = errors.New("device claim was already used")
+	ErrDedupeConflict      = errors.New("dedupe key belongs to another command")
+	ErrForbidden           = errors.New("forbidden")
 )
 
 type Store struct{ db *sql.DB }
@@ -45,17 +51,19 @@ type State struct {
 }
 
 type Device struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	AccountLabel *string `json:"account_label"`
-	Status       string  `json:"status"`
-	LastSeenAt   *int64  `json:"last_seen_at"`
-	CreatedAt    int64   `json:"created_at"`
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	AccountLabel   *string `json:"account_label"`
+	KeyFingerprint *string `json:"key_fingerprint,omitempty"`
+	Status         string  `json:"status"`
+	LastSeenAt     *int64  `json:"last_seen_at"`
+	CreatedAt      int64   `json:"created_at"`
 }
 
 type Task struct {
 	DeviceID      string  `json:"device_id"`
 	ThreadID      string  `json:"thread_id"`
+	Backend       *string `json:"backend,omitempty"`
 	Title         string  `json:"title"`
 	Project       *string `json:"project"`
 	Status        string  `json:"status"`
@@ -95,12 +103,13 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL, account_label TEXT, status TEXT NOT NULL DEFAULT 'offline',
-  last_seen_at INTEGER, created_at INTEGER NOT NULL
+  last_seen_at INTEGER, created_at INTEGER NOT NULL,
+  device_public_key TEXT, device_key_fingerprint TEXT, claimed_by_user_id TEXT, revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_devices_owner ON devices(owner_id);
 CREATE TABLE IF NOT EXISTS tasks (
   device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE, thread_id TEXT NOT NULL,
-  title TEXT NOT NULL, project TEXT, status TEXT NOT NULL, summary TEXT, latest_message TEXT,
+  title TEXT NOT NULL, project TEXT, backend TEXT, status TEXT NOT NULL, summary TEXT, latest_message TEXT,
   updated_at INTEGER NOT NULL, PRIMARY KEY(device_id, thread_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_device_updated ON tasks(device_id, updated_at DESC);
@@ -117,6 +126,47 @@ CREATE TABLE IF NOT EXISTS commands (
   completed_at INTEGER, result_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_commands_poll ON commands(device_id, state, id);
+CREATE TRIGGER IF NOT EXISTS erase_delivered_message_text AFTER UPDATE OF state ON commands
+WHEN NEW.kind='send_message' AND NEW.state IN ('completed','failed')
+BEGIN UPDATE commands SET body_json=json_remove(body_json,'$.text') WHERE id=NEW.id; END;
+CREATE TRIGGER IF NOT EXISTS erase_created_chat_text AFTER UPDATE OF state ON commands
+WHEN NEW.kind='create_thread' AND NEW.state IN ('completed','failed')
+BEGIN UPDATE commands SET body_json=json_remove(body_json,'$.text') WHERE id=NEW.id; END;
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workspaces (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('personal','team')),
+  created_by_user_id TEXT NOT NULL REFERENCES users(id), created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memberships (
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK(role IN ('owner','admin','member','viewer')), created_at INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id,workspace_id);
+CREATE TABLE IF NOT EXISTS controller_sessions (
+  token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_controller_sessions_user ON controller_sessions(user_id,expires_at);
+CREATE TABLE IF NOT EXISTS device_claims (
+  id TEXT PRIMARY KEY, claim_secret_hash TEXT NOT NULL, poll_token_hash TEXT NOT NULL UNIQUE,
+  device_public_key TEXT NOT NULL, device_key_fingerprint TEXT NOT NULL,
+  device_name TEXT NOT NULL, account_label TEXT, status TEXT NOT NULL DEFAULT 'pending',
+  workspace_id TEXT, approved_by_user_id TEXT, device_id TEXT, wrapped_device_token TEXT,
+  expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, approved_at INTEGER, delivered_at INTEGER,
+  legacy_device_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_device_claims_expiry ON device_claims(status,expires_at);
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, actor_user_id TEXT,
+  action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_workspace ON audit_events(workspace_id,created_at DESC,id DESC);
 `
 
 func Open(path string, busyTimeout time.Duration) (*Store, error) {
@@ -141,7 +191,17 @@ func Open(path string, busyTimeout time.Duration) (*Store, error) {
 	if err := migrateNullableTurnID(db); err != nil {
 		return cleanup(err)
 	}
-	if _, err := db.Exec("PRAGMA user_version=2"); err != nil {
+	if err := migrateDeviceIdentity(db); err != nil {
+		return cleanup(err)
+	}
+	if err := migrateDeviceClaims(db); err != nil {
+		return cleanup(err)
+	}
+	if err := migrateTaskBackend(db); err != nil {
+		return cleanup(err)
+	}
+	// Remove the experimental server-side transcript store. History is local to phones.
+	if _, err := db.Exec(`PRAGMA secure_delete=ON; DROP TABLE IF EXISTS conversation_messages; UPDATE tasks SET summary=NULL,latest_message=NULL; UPDATE commands SET body_json=json_remove(body_json,'$.text') WHERE kind IN ('send_message','create_thread') AND state IN ('completed','failed'); UPDATE commands SET result_json='{"submitted":true}' WHERE kind='send_message' AND state='completed'; UPDATE commands SET result_json=json_object('error',COALESCE(json_extract(result_json,'$.error'),'Message delivery failed')) WHERE kind='send_message' AND state='failed'; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA user_version=6`); err != nil {
 		return cleanup(fmt.Errorf("set sqlite schema version: %w", err))
 	}
 	if err := db.Ping(); err != nil {
@@ -215,7 +275,7 @@ func (s *Store) Enroll(ctx context.Context, code, name string, accountLabel *str
 
 func (s *Store) AuthenticateAgent(ctx context.Context, token string) (string, bool, error) {
 	var deviceID string
-	err := s.db.QueryRowContext(ctx, "SELECT id FROM devices WHERE token_hash=?", hash(token)).Scan(&deviceID)
+	err := s.db.QueryRowContext(ctx, "SELECT id FROM devices WHERE token_hash=? AND revoked_at IS NULL", hash(token)).Scan(&deviceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -237,13 +297,13 @@ func (s *Store) Sync(ctx context.Context, deviceID string, state protocol.AgentS
 	if _, err := tx.ExecContext(ctx, "DELETE FROM tasks WHERE device_id=?", deviceID); err != nil {
 		return err
 	}
-	taskStatement, err := tx.PrepareContext(ctx, `INSERT INTO tasks(device_id,thread_id,title,project,status,summary,latest_message,updated_at) VALUES(?,?,?,?,?,?,?,?)`)
+	taskStatement, err := tx.PrepareContext(ctx, `INSERT INTO tasks(device_id,thread_id,title,project,backend,status,summary,latest_message,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer taskStatement.Close()
 	for _, task := range state.Tasks {
-		if _, err := taskStatement.ExecContext(ctx, deviceID, task.ThreadID, task.Title, task.Project, task.Status, task.Summary, task.LatestMessage, int64(task.UpdatedAt)); err != nil {
+		if _, err := taskStatement.ExecContext(ctx, deviceID, task.ThreadID, task.Title, task.Project, task.Backend, task.Status, nil, nil, int64(task.UpdatedAt)); err != nil {
 			return err
 		}
 	}
@@ -269,13 +329,13 @@ func (s *Store) Sync(ctx context.Context, deviceID string, state protocol.AgentS
 
 func (s *Store) State(ctx context.Context, ownerID string, offlineBefore int64) (State, error) {
 	result := State{Devices: []Device{}, Tasks: []Task{}, Requests: []PendingRequest{}, Commands: []CommandStatus{}}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,account_label,CASE WHEN last_seen_at IS NULL OR last_seen_at<? THEN 'offline' ELSE status END,last_seen_at,created_at FROM devices WHERE owner_id=? ORDER BY created_at`, offlineBefore, ownerID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,account_label,device_key_fingerprint,CASE WHEN last_seen_at IS NULL OR last_seen_at<? THEN 'offline' ELSE status END,last_seen_at,created_at FROM devices WHERE owner_id=? AND revoked_at IS NULL ORDER BY created_at`, offlineBefore, ownerID)
 	if err != nil {
 		return result, err
 	}
 	for rows.Next() {
 		var item Device
-		if err := rows.Scan(&item.ID, &item.Name, &item.AccountLabel, &item.Status, &item.LastSeenAt, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.AccountLabel, &item.KeyFingerprint, &item.Status, &item.LastSeenAt, &item.CreatedAt); err != nil {
 			rows.Close()
 			return result, err
 		}
@@ -285,13 +345,13 @@ func (s *Store) State(ctx context.Context, ownerID string, offlineBefore int64) 
 		return result, err
 	}
 
-	rows, err = s.db.QueryContext(ctx, `SELECT t.device_id,t.thread_id,t.title,t.project,t.status,t.summary,t.latest_message,t.updated_at FROM tasks t JOIN devices d ON d.id=t.device_id WHERE d.owner_id=? ORDER BY t.updated_at DESC`, ownerID)
+	rows, err = s.db.QueryContext(ctx, `SELECT t.device_id,t.thread_id,t.title,t.project,t.backend,t.status,t.summary,t.latest_message,t.updated_at FROM tasks t JOIN devices d ON d.id=t.device_id WHERE d.owner_id=? AND d.revoked_at IS NULL ORDER BY t.updated_at DESC`, ownerID)
 	if err != nil {
 		return result, err
 	}
 	for rows.Next() {
 		var item Task
-		if err := rows.Scan(&item.DeviceID, &item.ThreadID, &item.Title, &item.Project, &item.Status, &item.Summary, &item.LatestMessage, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.DeviceID, &item.ThreadID, &item.Title, &item.Project, &item.Backend, &item.Status, &item.Summary, &item.LatestMessage, &item.UpdatedAt); err != nil {
 			rows.Close()
 			return result, err
 		}
@@ -301,7 +361,7 @@ func (s *Store) State(ctx context.Context, ownerID string, offlineBefore int64) 
 		return result, err
 	}
 
-	rows, err = s.db.QueryContext(ctx, `SELECT r.device_id,r.thread_id,r.request_id,r.turn_id,r.kind,r.payload_json,r.updated_at FROM pending_requests r JOIN devices d ON d.id=r.device_id WHERE d.owner_id=? ORDER BY r.updated_at DESC`, ownerID)
+	rows, err = s.db.QueryContext(ctx, `SELECT r.device_id,r.thread_id,r.request_id,r.turn_id,r.kind,r.payload_json,r.updated_at FROM pending_requests r JOIN devices d ON d.id=r.device_id WHERE d.owner_id=? AND d.revoked_at IS NULL ORDER BY r.updated_at DESC`, ownerID)
 	if err != nil {
 		return result, err
 	}
@@ -322,7 +382,7 @@ func (s *Store) State(ctx context.Context, ownerID string, offlineBefore int64) 
 		return result, err
 	}
 
-	rows, err = s.db.QueryContext(ctx, `SELECT c.id,c.device_id,c.kind,c.thread_id,c.state,c.created_at,c.claimed_at,c.completed_at,c.result_json FROM commands c JOIN devices d ON d.id=c.device_id WHERE d.owner_id=? ORDER BY c.created_at DESC LIMIT 100`, ownerID)
+	rows, err = s.db.QueryContext(ctx, `SELECT c.id,c.device_id,c.kind,c.thread_id,c.state,c.created_at,c.claimed_at,c.completed_at,c.result_json FROM commands c JOIN devices d ON d.id=c.device_id WHERE d.owner_id=? AND d.revoked_at IS NULL ORDER BY c.created_at DESC LIMIT 100`, ownerID)
 	if err != nil {
 		return result, err
 	}
@@ -348,7 +408,7 @@ func (s *Store) State(ctx context.Context, ownerID string, offlineBefore int64) 
 
 func (s *Store) CreateCommand(ctx context.Context, deviceID string, command protocol.Command, dedupeKey string) (int64, bool, error) {
 	var exists int
-	if err := s.db.QueryRowContext(ctx, "SELECT 1 FROM devices WHERE id=?", deviceID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRowContext(ctx, "SELECT 1 FROM devices WHERE id=? AND revoked_at IS NULL", deviceID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 		return 0, false, ErrDeviceNotFound
 	} else if err != nil {
 		return 0, false, err
@@ -373,7 +433,9 @@ func (s *Store) CreateCommand(ctx context.Context, deviceID string, command prot
 		return id, true, err
 	}
 	var id int64
-	if err := s.db.QueryRowContext(ctx, "SELECT id FROM commands WHERE dedupe_key=?", dedupeKey).Scan(&id); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT id FROM commands WHERE dedupe_key=? AND device_id=?", dedupeKey, deviceID).Scan(&id); errors.Is(err, sql.ErrNoRows) {
+		return 0, false, ErrDedupeConflict
+	} else if err != nil {
 		return 0, false, err
 	}
 	return id, false, nil
@@ -438,7 +500,45 @@ func (s *Store) Acknowledge(ctx context.Context, deviceID string, commandID int6
 	if err != nil {
 		return err
 	}
-	operation, err := s.db.ExecContext(ctx, `UPDATE commands SET state=?,completed_at=?,result_json=? WHERE id=? AND device_id=? AND state='claimed'`, state, time.Now().UnixMilli(), string(encoded), commandID, deviceID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var kind, threadID, workspaceID string
+	var commandBody []byte
+	var claimedByUserID *string
+	err = tx.QueryRowContext(ctx, `SELECT c.kind,c.thread_id,d.owner_id,d.claimed_by_user_id,c.body_json
+		FROM commands c JOIN devices d ON d.id=c.device_id
+		WHERE c.id=? AND c.device_id=? AND c.state='claimed'`, commandID, deviceID).Scan(&kind, &threadID, &workspaceID, &claimedByUserID, &commandBody)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrCommandNotClaimable
+	}
+	if err != nil {
+		return err
+	}
+	if kind == "send_message" {
+		// Desktop acknowledgements may include a turn payload. Keep only delivery status.
+		if ok {
+			encoded = []byte(`{"submitted":true}`)
+		} else {
+			message := "Message delivery failed"
+			if fields, valid := result.(map[string]any); valid {
+				if detail, valid := fields["error"].(string); valid {
+					message = detail
+				}
+			}
+			encoded, _ = json.Marshal(map[string]string{"error": message})
+		}
+	}
+	if kind == "create_thread" {
+		encoded, threadID, err = sanitizeCreatedThreadResult(ok, encoded, commandBody)
+		if err != nil {
+			return err
+		}
+	}
+	now := time.Now().UnixMilli()
+	operation, err := tx.ExecContext(ctx, `UPDATE commands SET state=?,thread_id=?,completed_at=?,result_json=? WHERE id=? AND device_id=? AND state='claimed'`, state, threadID, now, string(encoded), commandID, deviceID)
 	if err != nil {
 		return err
 	}
@@ -449,7 +549,18 @@ func (s *Store) Acknowledge(ctx context.Context, deviceID string, commandID int6
 	if changed == 0 {
 		return ErrCommandNotClaimable
 	}
-	return nil
+	// Legacy-enrolled devices have no claiming user and are intentionally kept
+	// outside the account audit log during the compatibility period.
+	if claimedByUserID != nil {
+		action := "command.completed"
+		if !ok {
+			action = "command.failed"
+		}
+		if err := insertAudit(ctx, tx, workspaceID, nil, action, "command", fmt.Sprintf("%d", commandID), map[string]any{"deviceId": deviceID, "kind": kind, "threadId": threadID}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func migrateNullableTurnID(db *sql.DB) error {
@@ -491,6 +602,71 @@ COMMIT;`)
 	if err != nil {
 		_, _ = db.Exec("ROLLBACK")
 		return fmt.Errorf("migrate pending request turn_id: %w", err)
+	}
+	return nil
+}
+
+func migrateDeviceIdentity(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(devices)")
+	if err != nil {
+		return fmt.Errorf("inspect device schema: %w", err)
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, required, primary int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &required, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"device_public_key", "TEXT"},
+		{"device_key_fingerprint", "TEXT"},
+		{"claimed_by_user_id", "TEXT"},
+		{"revoked_at", "INTEGER"},
+	} {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE devices ADD COLUMN " + column.name + " " + column.definition); err != nil {
+			return fmt.Errorf("add devices.%s: %w", column.name, err)
+		}
+	}
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_public_key ON devices(device_public_key) WHERE device_public_key IS NOT NULL"); err != nil {
+		return fmt.Errorf("index device public keys: %w", err)
+	}
+	return nil
+}
+
+func migrateDeviceClaims(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(device_claims)")
+	if err != nil {
+		return fmt.Errorf("inspect device claim schema: %w", err)
+	}
+	hasLegacyDeviceID := false
+	for rows.Next() {
+		var cid, required, primary int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &required, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		hasLegacyDeviceID = hasLegacyDeviceID || name == "legacy_device_id"
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !hasLegacyDeviceID {
+		if _, err := db.Exec("ALTER TABLE device_claims ADD COLUMN legacy_device_id TEXT"); err != nil {
+			return fmt.Errorf("add device_claims.legacy_device_id: %w", err)
+		}
 	}
 	return nil
 }

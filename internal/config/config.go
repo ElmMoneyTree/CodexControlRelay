@@ -72,6 +72,10 @@ type SecurityConfig struct {
 	ControlToken      string     `yaml:"control_token"`
 	ControlTokenEnv   string     `yaml:"control_token_env"`
 	AllowInsecureHTTP bool       `yaml:"allow_insecure_http"`
+	AllowRegistration bool       `yaml:"allow_registration"`
+	LegacyAPIEnabled  bool       `yaml:"legacy_api_enabled"`
+	AccountSessionTTL Duration   `yaml:"account_session_ttl"`
+	DeviceClaimTTL    Duration   `yaml:"device_claim_ttl"`
 	PairingCodeTTL    Duration   `yaml:"pairing_code_ttl"`
 	OfflineAfter      Duration   `yaml:"offline_after"`
 	RateLimits        RateLimits `yaml:"rate_limits"`
@@ -79,9 +83,11 @@ type SecurityConfig struct {
 }
 
 type RateLimits struct {
-	Enrollment RateLimit `yaml:"enrollment"`
-	Control    RateLimit `yaml:"control"`
-	Agent      RateLimit `yaml:"agent"`
+	Enrollment     RateLimit `yaml:"enrollment"`
+	Authentication RateLimit `yaml:"authentication"`
+	Claims         RateLimit `yaml:"claims"`
+	Control        RateLimit `yaml:"control"`
+	Agent          RateLimit `yaml:"agent"`
 }
 
 type RateLimit struct {
@@ -110,13 +116,18 @@ func Defaults() Config {
 			BusyTimeout: duration(5 * time.Second),
 		},
 		Security: SecurityConfig{
-			ControlTokenEnv: "CODEX_RELAY_CONTROL_TOKEN",
-			PairingCodeTTL:  duration(10 * time.Minute),
-			OfflineAfter:    duration(15 * time.Second),
+			ControlTokenEnv:   "CODEX_RELAY_CONTROL_TOKEN",
+			LegacyAPIEnabled:  true,
+			AccountSessionTTL: duration(30 * 24 * time.Hour),
+			DeviceClaimTTL:    duration(5 * time.Minute),
+			PairingCodeTTL:    duration(10 * time.Minute),
+			OfflineAfter:      duration(15 * time.Second),
 			RateLimits: RateLimits{
-				Enrollment: RateLimit{Requests: 10, Window: duration(time.Minute)},
-				Control:    RateLimit{Requests: 300, Window: duration(time.Minute)},
-				Agent:      RateLimit{Requests: 1200, Window: duration(time.Minute)},
+				Enrollment:     RateLimit{Requests: 10, Window: duration(time.Minute)},
+				Authentication: RateLimit{Requests: 20, Window: duration(time.Minute)},
+				Claims:         RateLimit{Requests: 60, Window: duration(time.Minute)},
+				Control:        RateLimit{Requests: 300, Window: duration(time.Minute)},
+				Agent:          RateLimit{Requests: 1200, Window: duration(time.Minute)},
 			},
 		},
 		Logging: LoggingConfig{Level: "info", Format: "json"},
@@ -210,13 +221,15 @@ func (c Config) Validate() error {
 	if len(c.Security.ControlToken) < 32 {
 		return errors.New("control token must contain at least 32 characters; set security.control_token or its configured environment variable")
 	}
-	if c.Security.PairingCodeTTL.Duration <= 0 || c.Security.OfflineAfter.Duration <= 0 {
-		return errors.New("security pairing and offline durations must be positive")
+	if c.Security.AccountSessionTTL.Duration <= 0 || c.Security.DeviceClaimTTL.Duration <= 0 || c.Security.PairingCodeTTL.Duration <= 0 || c.Security.OfflineAfter.Duration <= 0 {
+		return errors.New("security session, claim, pairing, and offline durations must be positive")
 	}
 	for name, limit := range map[string]RateLimit{
-		"enrollment": c.Security.RateLimits.Enrollment,
-		"control":    c.Security.RateLimits.Control,
-		"agent":      c.Security.RateLimits.Agent,
+		"enrollment":     c.Security.RateLimits.Enrollment,
+		"authentication": c.Security.RateLimits.Authentication,
+		"claims":         c.Security.RateLimits.Claims,
+		"control":        c.Security.RateLimits.Control,
+		"agent":          c.Security.RateLimits.Agent,
 	} {
 		if limit.Requests <= 0 || limit.Window.Duration <= 0 {
 			return fmt.Errorf("security.rate_limits.%s requests and window must be positive", name)

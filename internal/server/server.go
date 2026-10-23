@@ -22,6 +22,8 @@ import (
 )
 
 type Server struct {
+	conversations     conversationBridge
+	projects          projectBridge
 	cfg               config.Config
 	store             *store.Store
 	logger            *slog.Logger
@@ -29,18 +31,26 @@ type Server struct {
 	trustedProxy      []*net.IPNet
 	allowedOrigin     map[string]bool
 	enrollmentLimiter *rateLimiter
+	authLimiter       *rateLimiter
+	claimLimiter      *rateLimiter
 	controlLimiter    *rateLimiter
 	agentLimiter      *rateLimiter
+	claimWrapKey      []byte
 }
 
 func New(cfg config.Config, database *store.Store, logger *slog.Logger) (*Server, error) {
 	result := &Server{
 		cfg: cfg, store: database, logger: logger,
+		conversations:     conversationBridge{pending: map[string]*conversationRequest{}},
+		projects:          projectBridge{pending: map[string]*projectRequest{}},
 		controlHash:       sha256.Sum256([]byte(cfg.Security.ControlToken)),
 		allowedOrigin:     map[string]bool{},
 		enrollmentLimiter: newRateLimiter(cfg.Security.RateLimits.Enrollment),
+		authLimiter:       newRateLimiter(cfg.Security.RateLimits.Authentication),
+		claimLimiter:      newRateLimiter(cfg.Security.RateLimits.Claims),
 		controlLimiter:    newRateLimiter(cfg.Security.RateLimits.Control),
 		agentLimiter:      newRateLimiter(cfg.Security.RateLimits.Agent),
+		claimWrapKey:      []byte(cfg.Security.ControlToken),
 	}
 	for _, value := range cfg.Server.TrustedProxies {
 		if ip := net.ParseIP(value); ip != nil {
@@ -88,7 +98,17 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	case r.Method == http.MethodGet && (r.URL.Path == "/claim/app.js" || r.URL.Path == "/claim/app.css"):
+		s.claimAsset(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/claim/"):
+		s.claimPage(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/"):
+		s.v1(w, r, clientIP)
 	case strings.HasPrefix(r.URL.Path, "/control/"):
+		if !s.cfg.Security.LegacyAPIEnabled && r.URL.Path != "/control/accounts" {
+			s.writeJSON(w, http.StatusNotFound, map[string]any{"error": "Not found"})
+			return
+		}
 		if !s.allow(w, s.controlLimiter, "control:"+clientIP) {
 			return
 		}
@@ -98,6 +118,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		}
 		s.control(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/agent/enroll":
+		if !s.cfg.Security.LegacyAPIEnabled {
+			s.writeJSON(w, http.StatusNotFound, map[string]any{"error": "Not found"})
+			return
+		}
 		if !s.allow(w, s.enrollmentLimiter, "enroll:"+clientIP) {
 			return
 		}
@@ -128,6 +152,22 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/control/projects":
+		ownerID := r.URL.Query().Get("ownerId")
+		if ownerID == "" {
+			ownerID = "owner"
+		}
+		s.projectCatalog(w, r, ownerID, false)
+	case r.Method == http.MethodGet && (r.URL.Path == "/control/messages" || r.URL.Path == "/control/attachments"):
+		ownerID := r.URL.Query().Get("ownerId")
+		if ownerID == "" {
+			ownerID = "owner"
+		}
+		if r.URL.Path == "/control/attachments" {
+			s.conversationAttachment(w, r, ownerID)
+		} else {
+			s.conversationMessages(w, r, ownerID)
+		}
 	case r.Method == http.MethodPost && r.URL.Path == "/control/pairing-codes":
 		var input struct {
 			OwnerID string `json:"ownerId"`
@@ -150,6 +190,31 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeJSON(w, http.StatusCreated, pair)
+	case r.Method == http.MethodPost && r.URL.Path == "/control/accounts":
+		var input struct {
+			Email                 string `json:"email"`
+			DisplayName           string `json:"displayName"`
+			Password              string `json:"password"`
+			PersonalWorkspaceName string `json:"personalWorkspaceName"`
+		}
+		if err := s.decodeBody(w, r, &input); err != nil {
+			s.badRequest(w, err)
+			return
+		}
+		result, err := s.store.CreateAccount(r.Context(), input.Email, input.DisplayName, input.Password, input.PersonalWorkspaceName, s.cfg.Security.AccountSessionTTL.Duration)
+		if errors.Is(err, store.ErrAccountExists) {
+			s.writeJSON(w, http.StatusConflict, map[string]any{"error": "Account already exists"})
+			return
+		}
+		if errors.Is(err, store.ErrInvalidCredentials) {
+			s.writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Account details are invalid"})
+			return
+		}
+		if err != nil {
+			s.internalError(w, err)
+			return
+		}
+		s.writeJSON(w, http.StatusCreated, result)
 	case r.Method == http.MethodGet && r.URL.Path == "/control/state":
 		ownerID := r.URL.Query().Get("ownerId")
 		if ownerID == "" {
@@ -181,6 +246,10 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		id, created, err := s.store.CreateCommand(r.Context(), deviceID, command, dedupe)
 		if errors.Is(err, store.ErrDeviceNotFound) {
 			s.writeJSON(w, http.StatusNotFound, map[string]any{"error": "Device not found"})
+			return
+		}
+		if errors.Is(err, store.ErrDedupeConflict) {
+			s.writeJSON(w, http.StatusConflict, map[string]any{"error": "Dedupe key belongs to another command"})
 			return
 		}
 		if err != nil {
@@ -242,6 +311,14 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) agent(w http.ResponseWriter, r *http.Request, deviceID string) {
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/agent/project-requests":
+		s.projectRequests(w, r, deviceID)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/agent/project-responses/"):
+		s.projectResponse(w, r, deviceID)
+	case r.Method == http.MethodGet && r.URL.Path == "/agent/conversation-requests":
+		s.conversationRequests(w, r, deviceID)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/agent/conversation-responses/"):
+		s.conversationResponse(w, r, deviceID)
 	case r.Method == http.MethodPut && r.URL.Path == "/agent/state":
 		data, err := s.readBody(w, r)
 		if err != nil {
@@ -428,13 +505,16 @@ func (s *Server) cors(w http.ResponseWriter, r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	if !s.allowedOrigin[origin] {
+	// The Relay-hosted claim portal is same-origin and must work even when no
+	// separate browser Controller origins are configured. Other origins remain
+	// opt-in through security.allowed_origins.
+	if origin != strings.TrimSuffix(s.publicOrigin(r), "/") && !s.allowedOrigin[origin] {
 		s.writeJSON(w, http.StatusForbidden, map[string]any{"error": "Origin is not allowed"})
 		return false
 	}
 	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Vary", "Origin")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Claim-Secret")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 	w.Header().Set("Access-Control-Max-Age", "600")
 	return true

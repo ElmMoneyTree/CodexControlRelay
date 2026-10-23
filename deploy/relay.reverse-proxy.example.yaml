@@ -12,6 +12,10 @@ database:
 security:
   control_token_env: CODEX_RELAY_CONTROL_TOKEN
   allow_insecure_http: false
+  allow_registration: false
+  legacy_api_enabled: true
+  account_session_ttl: 720h
+  device_claim_ttl: 5m
   allowed_origins: []
 
 logging:

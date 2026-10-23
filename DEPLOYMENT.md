@@ -4,6 +4,35 @@
 
 源码构建、本机启动和客户端连接请先阅读 [README](./README.md)。以下命令在独立仓库根目录执行。
 
+## CentOS 预编译包安装与升级
+
+0.2.3 增加手机本地对话的临时转发链路，搭配插件 0.3.2 和手机 App 0.3.5（8）使用。聊天历史保存在手机 SQLite，Relay 不存储聊天历史。升级会移除实验版历史表、已存的回复摘要与最新回复正文，消息命令交付结束后会清除输入正文；账号、空间、设备身份和审批能力保留。
+
+部署前按下文备份数据库与配置，再使用安装器升级；不要删除现有 `relay.env`，也不需要让已认领的电脑重新扫码。
+
+将 `codex-relay-centos-linux-amd64-0.2.3.tar.gz` 和对应的 `.sha256` 文件上传到服务器同一目录后执行：
+
+```bash
+sha256sum -c codex-relay-centos-linux-amd64-0.2.3.tar.gz.sha256
+tar -xzf codex-relay-centos-linux-amd64-0.2.3.tar.gz
+cd codex-relay-centos-linux-amd64-0.2.3
+sudo ./install.sh https://codex-relay.kuajingvs.com
+```
+
+安装器会保留已有的 `/etc/codex-relay/relay.yaml`、`relay.env` 和 SQLite 数据库，校验新配置后显式重启服务，并等待本机 `/ready` 成功。首次安装会生成新的管理令牌；升级不得删除或重新生成已有 `relay.env`。
+
+完整发布门槛与 Windows 真机签署步骤见 [Device Claim 发布验收矩阵](./RELEASE-ACCEPTANCE.md)。
+
+部署后检查公网入口和新认证路由：
+
+```bash
+curl -fsS https://codex-relay.kuajingvs.com/health
+curl -fsS https://codex-relay.kuajingvs.com/ready
+curl -sS -o /dev/null -w '%{http_code}\n' https://codex-relay.kuajingvs.com/v1/me
+```
+
+前两个请求应返回 `{"ok":true}`；未登录访问 `/v1/me` 应返回 `401`。如果返回 `404`，通常是旧 Relay 进程仍在运行，检查 `systemctl status codex-relay` 和 Nginx upstream。
+
 ## 配置
 
 完整模板见 [relay.example.yaml](./relay.example.yaml)。YAML 使用严格字段检查，字段拼错会导致启动失败。
@@ -20,10 +49,14 @@
 | `security.control_token` | 空 | 控制端管理令牌，至少 32 个字符 |
 | `security.control_token_env` | `CODEX_RELAY_CONTROL_TOKEN` | 读取令牌的环境变量名 |
 | `security.allow_insecure_http` | `false` | 明确允许非回环地址上的明文 HTTP |
+| `security.allow_registration` | `false` | 是否允许 App 用户自行创建账号 |
+| `security.legacy_api_enabled` | `true` | 迁移期启用旧控制接口与数字配对 |
+| `security.account_session_ttl` | `720h` | 手机/浏览器账号会话有效期 |
+| `security.device_claim_ttl` | `5m` | 一次性设备认领有效期 |
 | `security.pairing_code_ttl` | `10m` | 一次性配对码有效期 |
 | `security.offline_after` | `15s` | 设备判定离线的时间 |
 | `security.allowed_origins` | 空 | 浏览器前端允许的精确 origin 列表 |
-| `security.rate_limits.*` | 见模板 | 配对、控制端和 Agent 的按 IP 限流 |
+| `security.rate_limits.*` | 见模板 | 登录、认领、旧控制端和 Agent 的按 IP 限流 |
 | `logging.level` | `info` | `debug`、`info`、`warn` 或 `error` |
 | `logging.format` | `json` | `json` 或 `text` |
 
@@ -39,6 +72,23 @@
 为兼容旧版启动方式，也支持 `HOST`、`PORT`、`RELAY_DB_PATH` 和 `CONTROL_TOKEN`。部署脚本应优先使用 `CODEX_RELAY_*`。
 
 ## 公网部署
+
+### 首个账号
+
+服务启动后，用只保存在服务器上的管理令牌调用本机 bootstrap 接口创建首个账号。手机用户只获得自己的邮箱和密码，不接触管理令牌：
+
+```bash
+set -a
+source /etc/codex-relay/relay.env
+set +a
+curl --fail-with-body http://127.0.0.1:8787/control/accounts \
+  -H "Authorization: Bearer $CODEX_RELAY_CONTROL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"owner@example.com","displayName":"Owner","password":"replace-with-a-strong-password","personalWorkspaceName":"我的空间"}'
+unset CODEX_RELAY_CONTROL_TOKEN
+```
+
+此接口返回的账号会话令牌无需保存，随后直接在手机 App 登录即可。生产环境可保持关闭公开注册，再由 Owner 在 App 创建团队并添加已有账号。
 
 ### 方式一：Nginx/Caddy 终止 HTTPS
 
@@ -94,7 +144,14 @@ Go Relay 可以直接打开旧 Relay 的 SQLite 文件。迁移时避免两个�
 4. 先运行 `codex-relay --config ... --check-config`，再启动服务。
 5. 检查 `/ready`、Controller 设备列表和至少一个 Agent 的同步。
 
-Go Relay 会自动把旧版 `pending_requests.turn_id NOT NULL` 表升级为可空版本，以支持 MCP 请求。回滚时先停止 Go Relay，再用同一个数据库启动 Node Relay 即可。跨实现兼容 E2E 位于原始 Codex Control 工作区，本独立仓库不包含该脚本。
+Go Relay 会把数据库升级到 schema 6：旧版 `pending_requests.turn_id` 变为可空，设备表增加密钥身份与撤销字段，并创建账号、空间、成员、短期认领和审计表。schema 6 还会移除实验版聊天历史表和已完成消息的正文副本。升级前必须备份；新 schema 写入账号数据后，不应直接用旧 Node Relay 回滚写入同一数据库。
+
+旧 Windows 插件不必先删除配置。在已连接状态运行新版插件的“认领此设备”操作，它会用旧设备令牌证明身份。批准后 Relay 保留设备 ID、任务与待办，清除迁移前尚未执行的命令，轮换令牌并绑定目标空间。认领过期或未批准时旧连接不变。全部旧 Controller 迁移后，设置：
+
+```yaml
+security:
+  legacy_api_enabled: false
+```
 
 ## 健康检查与运维
 
@@ -107,7 +164,9 @@ curl -fsS https://relay.example.com/ready
 
 定期备份 SQLite。最稳妥的方法是先停止服务再复制主文件；在线备份需要使用 SQLite 的备份机制，不能只复制主文件而遗漏 WAL。数据库目录权限建议为 `0750`，数据库文件为 `0600`。控制令牌等同于 Controller 管理密码，应放在服务环境文件或密钥管理系统中，避免提交到仓库。
 
-服务使用一次性配对码、仅保存设备令牌的 SHA-256、固定请求体上限、控制/Agent 鉴权、CORS 精确白名单、可信代理链解析、限流、TLS 1.2 下限和优雅停机。Relay 不保存任何 Codex 账号密码或会话 Cookie。
+账号密码使用 Argon2id 保存；账号会话、设备令牌、认领密钥和轮询令牌仅保存 SHA-256。短期下发中的设备令牌使用管理密钥派生的 AES-GCM 密钥包裹。设备认领要求 Ed25519 持钥证明，批准只能执行一次；工作空间权限在命令写入事务内再次校验。二维码密钥通过 URL 片段和请求头传递，不进入 Relay 的路径日志。服务同时具备固定请求体上限、精确 CORS、可信代理链解析、分组限流、TLS 1.2 下限和优雅停机。
+
+设备认领正在等待批准时不要轮换 `CODEX_RELAY_CONTROL_TOKEN`，因为它也用于包裹待下发的短期设备令牌。认领会话最多五分钟，过期后重新发起即可。
 
 ## 构建和验证
 

@@ -31,6 +31,14 @@ security:
   control_token_env: CODEX_RELAY_CONTROL_TOKEN
   # Leave false when Relay terminates TLS itself or only listens on loopback.
   allow_insecure_http: false
+  # Public account registration is disabled by default. Administrators can
+  # still create the first account through the control-token bootstrap API.
+  allow_registration: false
+  # Keep true while old Controller/pairing clients are being migrated. Set
+  # false afterward; existing Agents and in-place device migration still work.
+  legacy_api_enabled: true
+  account_session_ttl: 720h
+  device_claim_ttl: 5m
   pairing_code_ttl: 10m
   offline_after: 15s
   # Keep empty for native Controller/mobile clients. Add exact HTTPS origins
@@ -39,6 +47,12 @@ security:
   rate_limits:
     enrollment:
       requests: 10
+      window: 1m
+    authentication:
+      requests: 20
+      window: 1m
+    claims:
+      requests: 60
       window: 1m
     control:
       requests: 300

@@ -19,7 +19,7 @@ const (
 )
 
 var commandKinds = map[string]bool{
-	"send_message": true, "command_approval": true, "file_approval": true,
+	"create_thread": true, "send_message": true, "command_approval": true, "file_approval": true,
 	"permissions_approval": true, "user_input_response": true, "mcp_response": true,
 }
 
@@ -59,12 +59,13 @@ func (t *Timestamp) UnmarshalJSON(data []byte) error {
 }
 
 type Task struct {
-	ThreadID      string  `json:"threadId"`
-	Title         string  `json:"title"`
-	Project       *string `json:"project"`
-	Status        string  `json:"status"`
-	Summary       *string `json:"summary"`
-	LatestMessage *string `json:"latestMessage"`
+	ThreadID      string    `json:"threadId"`
+	Backend       *string   `json:"backend,omitempty"`
+	Title         string    `json:"title"`
+	Project       *string   `json:"project"`
+	Status        string    `json:"status"`
+	Summary       *string   `json:"summary"`
+	LatestMessage *string   `json:"latestMessage"`
 	UpdatedAt     Timestamp `json:"updatedAt"`
 }
 
@@ -89,6 +90,8 @@ type ValidatedRequest struct {
 type Command struct {
 	Kind      string
 	ThreadID  string
+	Backend   *string
+	ProjectID *string
 	RequestID *string
 	TurnID    *string
 	Text      *string
@@ -115,6 +118,12 @@ func DecodeAgentState(data []byte) (AgentState, []ValidatedRequest, error) {
 		var err error
 		if task.ThreadID, err = required(task.ThreadID, "threadId", 100); err != nil {
 			return state, nil, err
+		}
+		if task.Backend, err = optional(task.Backend, "backend", 20); err != nil {
+			return state, nil, err
+		}
+		if task.Backend != nil && !oneOf(*task.Backend, "codex", "chatgpt") {
+			return state, nil, errors.New("task backend is unsupported")
 		}
 		if task.Title, err = required(task.Title, "title", 500); err != nil {
 			return state, nil, err
@@ -173,6 +182,8 @@ func DecodeCommand(data []byte) (Command, string, error) {
 		DeviceID  string              `json:"deviceId"`
 		Kind      string              `json:"kind"`
 		ThreadID  string              `json:"threadId"`
+		Backend   *string             `json:"backend"`
+		ProjectID *string             `json:"projectId"`
 		RequestID json.RawMessage     `json:"requestId"`
 		TurnID    *string             `json:"turnId"`
 		Text      *string             `json:"text"`
@@ -193,7 +204,20 @@ func DecodeCommand(data []byte) (Command, string, error) {
 	if err != nil || !commandKinds[kind] {
 		return Command{}, "", errors.New("command kind is unsupported")
 	}
-	threadID, err := required(raw.ThreadID, "threadId", 100)
+	threadID := ""
+	if kind != "create_thread" {
+		threadID, err = required(raw.ThreadID, "threadId", 100)
+		if err != nil {
+			return Command{}, "", err
+		}
+	} else if raw.ThreadID != "" {
+		return Command{}, "", errors.New("new chats cannot have a threadId")
+	}
+	backend, err := optional(raw.Backend, "backend", 20)
+	if err != nil || (backend != nil && !oneOf(*backend, "codex", "chatgpt")) {
+		return Command{}, "", errors.New("backend is unsupported")
+	}
+	projectID, err := optional(raw.ProjectID, "projectId", 200)
 	if err != nil {
 		return Command{}, "", err
 	}
@@ -220,6 +244,13 @@ func DecodeCommand(data []byte) (Command, string, error) {
 
 	answers := raw.Answers
 	switch kind {
+	case "create_thread":
+		if backend == nil || text == nil {
+			return Command{}, "", errors.New("new chat backend and text are required")
+		}
+		if requestID != nil || turnID != nil || decision != nil || action != nil || len(answers) != 0 || raw.Content != nil {
+			return Command{}, "", errors.New("new chat fields are invalid")
+		}
 	case "send_message":
 		if text == nil {
 			return Command{}, "", errors.New("message text is required")
@@ -253,6 +284,14 @@ func DecodeCommand(data []byte) (Command, string, error) {
 	}
 
 	normalized := map[string]any{"kind": kind, "threadId": threadID, "requestId": requestID, "turnId": turnID, "text": text, "decision": decision, "answers": answers, "action": action, "content": raw.Content}
+	if kind == "create_thread" {
+		normalized = map[string]any{"kind": kind, "backend": backend, "text": text}
+		if projectID != nil {
+			normalized["projectId"] = projectID
+		}
+	} else if kind == "send_message" && backend != nil {
+		normalized["backend"] = backend
+	}
 	body, _ := json.Marshal(normalized)
 	dedupe := ""
 	if raw.DedupeKey != nil {
@@ -261,7 +300,7 @@ func DecodeCommand(data []byte) (Command, string, error) {
 			return Command{}, "", err
 		}
 	}
-	return Command{Kind: kind, ThreadID: threadID, RequestID: requestID, TurnID: turnID, Text: text, Decision: decision, Action: action, Answers: answers, Content: raw.Content, Body: body}, deviceID + "\x00" + dedupe, nil
+	return Command{Kind: kind, ThreadID: threadID, Backend: backend, ProjectID: projectID, RequestID: requestID, TurnID: turnID, Text: text, Decision: decision, Action: action, Answers: answers, Content: raw.Content, Body: body}, deviceID + "\x00" + dedupe, nil
 }
 
 func SplitDeviceAndDedupe(value string) (string, string) {

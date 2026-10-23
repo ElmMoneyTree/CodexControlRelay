@@ -33,10 +33,14 @@ security:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Path != filepath.Join(directory, DefaultFileName) {
+	resolvedDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Path != filepath.Join(resolvedDirectory, DefaultFileName) {
 		t.Fatalf("unexpected config path %q", cfg.Path)
 	}
-	if cfg.Database.Path != filepath.Join(directory, "state", "relay.sqlite") {
+	if cfg.Database.Path != filepath.Join(resolvedDirectory, "state", "relay.sqlite") {
 		t.Fatalf("relative database path was not resolved from config: %q", cfg.Database.Path)
 	}
 	if cfg.Server.ReadTimeout.String() != "15s" {
